@@ -4,6 +4,7 @@ using System;
 using System.IO;
 using System.Reflection;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 using UnityEngine.Video;
 
 namespace HideoutTV
@@ -11,7 +12,7 @@ namespace HideoutTV
     [BepInPlugin(
         "com.nathan.hideouttv",
         "Hideout TV",
-        "1.0.0"
+        "1.0.1"
     )]
     public class Plugin : BaseUnityPlugin
     {
@@ -36,6 +37,12 @@ namespace HideoutTV
         private VideoSource originalSource;
         private string originalUrl;
         private RenderTexture originalTexture;
+        private bool originalIsLooping;
+        private VideoAudioOutputMode originalAudioOutputMode;
+        private AudioSource originalTargetAudioSource;
+        private bool originalAudioTrackEnabled;
+        private bool originalWasPlaying;
+        private bool addedAudioSource;
 
         private bool customVideoPlaying = false;
         private string[] channels = new string[0];
@@ -45,6 +52,9 @@ namespace HideoutTV
         private string channelIndicatorText = "";
         private ConfigEntry<bool> rescanChannelsButton;
         private bool rescanRequested = false;
+        private ConfigEntry<KeyboardShortcut> rewindKey;
+        private ConfigEntry<KeyboardShortcut> fastForwardKey;
+        private ConfigEntry<int> seekSeconds;
 
 
         private void Awake()
@@ -87,6 +97,33 @@ namespace HideoutTV
                     new AcceptableValueRange<float>(
                         0.0f,
                         1.0f
+                    )
+                )
+            );
+
+            rewindKey = Config.Bind(
+    "Controls",
+    "Rewind",
+    new KeyboardShortcut(KeyCode.F5),
+    "Rewind the current video."
+);
+
+            fastForwardKey = Config.Bind(
+                "Controls",
+                "Fast Forward",
+                new KeyboardShortcut(KeyCode.F6),
+                "Fast forward the current video."
+            );
+
+            seekSeconds = Config.Bind(
+                "Controls",
+                "Seek Amount (Seconds)",
+                10,
+                new ConfigDescription(
+                    "Number of seconds to rewind or fast forward.",
+                    new AcceptableValueRange<int>(
+                        1,
+                        300
                     )
                 )
             );
@@ -154,7 +191,33 @@ namespace HideoutTV
 );
 
             Logger.LogInfo("Hideout TV loaded.");
-        
+
+            SceneManager.activeSceneChanged += OnActiveSceneChanged;
+            SceneManager.sceneUnloaded += OnSceneUnloaded;
+        }
+
+        private void OnDestroy()
+        {
+            SceneManager.activeSceneChanged -= OnActiveSceneChanged;
+            SceneManager.sceneUnloaded -= OnSceneUnloaded;
+            CleanupTV(false);
+        }
+
+        private void OnActiveSceneChanged(Scene previousScene, Scene nextScene)
+        {
+            // Stop the external video decoder before Tarkov tears down the old
+            // hideout. Leaving it attached can stall the next hideout load.
+            CleanupTV(true);
+        }
+
+        private void OnSceneUnloaded(Scene scene)
+        {
+            // Unity objects compare equal to null after their scene is unloaded,
+            // so also clear all managed state even if restoration was too late.
+            if (tvPlayer == null)
+            {
+                ClearCachedState();
+            }
         }
 
         private void DrawRescanButton(ConfigEntryBase entry)
@@ -201,6 +264,13 @@ namespace HideoutTV
 
         private void Update()
         {
+            // Never carry the "playing" state or destroyed Unity references
+            // from an old hideout into a raid/new hideout instance.
+            if (customVideoPlaying && tvPlayer == null)
+            {
+                ClearCachedState();
+            }
+
             if (rescanRequested)
             {
                 rescanRequested = false;
@@ -243,10 +313,21 @@ namespace HideoutTV
 
             if (customVideoPlaying)
             {
+                if (rewindKey.Value.IsDown())
+                {
+                    SeekVideo(-seekSeconds.Value);
+                }
+
+                if (fastForwardKey.Value.IsDown())
+                {
+                    SeekVideo(seekSeconds.Value);
+                }
+
                 if (pausePlayKey.Value.IsDown())
                 {
                     TogglePause();
                 }
+
                 if (nextChannelKey.Value.IsDown())
                 {
                     ChangeChannel(1);
@@ -259,7 +340,9 @@ namespace HideoutTV
 
                 FindPlayer();
                 UpdateDistanceVolume();
+
             }
+
         }
 
         private void UpdateDistanceVolume()
@@ -342,6 +425,47 @@ namespace HideoutTV
                     master *
                     distanceMultiplier
                 );
+        }
+
+        private void SeekVideo(double seconds)
+        {
+            if (tvPlayer == null || !customVideoPlaying)
+            {
+                return;
+            }
+
+            double newTime = tvPlayer.time + seconds;
+
+            if (newTime < 0.0)
+            {
+                newTime = 0.0;
+            }
+
+            if (tvPlayer.length > 0.0 &&
+                newTime > tvPlayer.length)
+            {
+                newTime = tvPlayer.length;
+            }
+
+            tvPlayer.time = newTime;
+
+            if (seconds > 0)
+            {
+                channelIndicatorText =
+                    "Fast Forward +" +
+                    seekSeconds.Value +
+                    "s";
+            }
+            else
+            {
+                channelIndicatorText =
+                    "Rewind -" +
+                    seekSeconds.Value +
+                    "s";
+            }
+
+            channelIndicatorTimer =
+                ChannelIndicatorDuration;
         }
 
         private void TogglePause()
@@ -509,13 +633,12 @@ namespace HideoutTV
             if (tvPlayer == null)
                 return;
 
-            audioSource =
-                tvPlayer.gameObject.GetComponent<AudioSource>();
-
             if (audioSource == null)
             {
                 audioSource =
                     tvPlayer.gameObject.AddComponent<AudioSource>();
+
+                addedAudioSource = true;
             }
 
             audioSource.playOnAwake = false;
@@ -656,6 +779,22 @@ namespace HideoutTV
             originalClip = tvPlayer.clip;
             originalUrl = tvPlayer.url;
             originalTexture = tvPlayer.targetTexture;
+            originalIsLooping = tvPlayer.isLooping;
+            originalAudioOutputMode = tvPlayer.audioOutputMode;
+            originalWasPlaying = tvPlayer.isPlaying;
+            originalTargetAudioSource = null;
+            originalAudioTrackEnabled = false;
+
+            if (tvPlayer.audioTrackCount > 0)
+            {
+                originalAudioTrackEnabled = tvPlayer.IsAudioTrackEnabled(0);
+
+                if (originalAudioOutputMode == VideoAudioOutputMode.AudioSource)
+                {
+                    originalTargetAudioSource = tvPlayer.GetTargetAudioSource(0);
+                }
+            }
+
             tvPlayer.Stop();
 
             tvPlayer.source = VideoSource.Url;
@@ -673,31 +812,66 @@ namespace HideoutTV
 
         private void RestoreOriginalTV()
         {
-            if (tvPlayer == null)
-                return;
-
-            tvPlayer.Stop();
-
-            tvPlayer.source =
-                originalSource;
-
-            tvPlayer.clip =
-                originalClip;
-
-            tvPlayer.url =
-                originalUrl ?? "";
-
-            tvPlayer.targetTexture =
-                originalTexture;
-
-            tvPlayer.Play();
-
-            customVideoPlaying =
-                false;
+            CleanupTV(true);
 
             Logger.LogInfo(
                 "Original Hideout TV restored."
             );
+        }
+
+        private void CleanupTV(bool restoreOriginal)
+        {
+            if (tvPlayer != null)
+            {
+                tvPlayer.Stop();
+
+                if (restoreOriginal && customVideoPlaying)
+                {
+                    tvPlayer.source = originalSource;
+                    tvPlayer.clip = originalClip;
+                    tvPlayer.url = originalUrl ?? "";
+                    tvPlayer.targetTexture = originalTexture;
+                    tvPlayer.isLooping = originalIsLooping;
+                    tvPlayer.audioOutputMode = originalAudioOutputMode;
+
+                    if (tvPlayer.audioTrackCount > 0)
+                    {
+                        tvPlayer.EnableAudioTrack(0, originalAudioTrackEnabled);
+
+                        if (originalAudioOutputMode == VideoAudioOutputMode.AudioSource)
+                        {
+                            tvPlayer.SetTargetAudioSource(0, originalTargetAudioSource);
+                        }
+                    }
+
+                    if (originalWasPlaying)
+                    {
+                        tvPlayer.Play();
+                    }
+                }
+            }
+
+            if (addedAudioSource && audioSource != null)
+            {
+                Destroy(audioSource);
+            }
+
+            ClearCachedState();
+        }
+
+        private void ClearCachedState()
+        {
+            customVideoPlaying = false;
+            tvPlayer = null;
+            audioSource = null;
+            playerTransform = null;
+            originalClip = null;
+            originalUrl = null;
+            originalTexture = null;
+            originalTargetAudioSource = null;
+            originalWasPlaying = false;
+            originalAudioTrackEnabled = false;
+            addedAudioSource = false;
         }
 
         private string GetPath(GameObject obj)
